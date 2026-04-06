@@ -1,185 +1,180 @@
 #!/usr/bin/env bash
-# Restart Claude Code in tmux sessions
+# cc-restart.sh — Restart Claude Code in tmux
 #
-# Usage:
-#   cc-restart.sh single <tmux-session> <project-dir>   — restart one session
-#   cc-restart.sh all                                     — restart all running sessions
+# Usage: cc-restart.sh single <session> <project-dir>
+#        cc-restart.sh all
 #
-# Called without __RUN, it backgrounds itself with nohup and exits immediately.
-# Called with __RUN=1, it performs the actual restart logic.
+# First invocation backgrounds itself (nohup+disown) then exits.
+# The backgrounded copy (__RUN=1) does the actual work.
 
-MAX_RETRIES=3
+set -euo pipefail
+
 LOG="/tmp/cc-restart.log"
-log() { echo "[$(date)] $*" >> "$LOG"; }
+RETRIES=3
+CLAUDE_CMD="claude --dangerously-skip-permissions --channels plugin:discord@claude-plugins-official"
 
-# Kill the claude process in a specific tmux pane.
-# Handles both cases:
-#   1) claude IS the pane process (started via tmux new-session ... claude)
-#   2) claude is a child of a shell in the pane
-kill_claude_in_pane() {
-  local session="$1"
-  local pane_pid
-  pane_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
-  [ -z "$pane_pid" ] && return 1
+log() { printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >> "$LOG"; }
 
-  # Check if the pane process itself is claude
-  local pane_cmd
-  pane_cmd=$(ps -p "$pane_pid" -o comm= 2>/dev/null)
-  if [[ "$pane_cmd" == *claude* ]]; then
-    log "kill_claude_in_pane: killing pane process $pane_pid (cmd=$pane_cmd)"
-    kill "$pane_pid" 2>/dev/null || true
-    return 0
-  fi
+# --- helpers ---
 
-  # Otherwise look for claude as a child process
-  for pid in $(pgrep -P "$pane_pid" -f "claude" 2>/dev/null); do
-    log "kill_claude_in_pane: killing child $pid"
-    kill "$pid" 2>/dev/null || true
-  done
-  return 0
-}
+# Get the PID that owns a tmux pane
+pane_pid() { tmux list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1; }
 
-# Check if claude is running in a specific tmux pane
-is_claude_running() {
-  local session="$1"
-  local pane_pid
-  pane_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
-  [ -z "$pane_pid" ] && return 1
+# Find claude PID in a session. Claude can be:
+#   1) The pane process itself (tmux new-session ... claude)
+#   2) A child of the pane's shell (send-keys "claude ...")
+find_claude_pid() {
+  local session="$1" ppid
+  ppid=$(pane_pid "$session") || return 1
+  [ -z "$ppid" ] && return 1
 
   # Check if pane process itself is claude
   local pane_cmd
-  pane_cmd=$(ps -p "$pane_pid" -o comm= 2>/dev/null)
+  pane_cmd=$(ps -p "$ppid" -o comm= 2>/dev/null)
   if [[ "$pane_cmd" == *claude* ]]; then
+    echo "$ppid"
     return 0
   fi
 
   # Check children
-  pgrep -P "$pane_pid" -f "claude" > /dev/null 2>&1
+  ps -eo pid=,ppid=,args= 2>/dev/null \
+    | awk -v p="$ppid" '$2==p && /claude/ {print $1; exit}'
 }
 
-# Check if a tmux pane has claude running (for scanning)
-pane_has_claude() {
-  local session="$1"
-  local pane_pid
-  pane_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
-  [ -z "$pane_pid" ] && return 1
+# Kill claude in a session, wait for it to die
+kill_claude() {
+  local session="$1" pid
+  pid=$(find_claude_pid "$session")
+  [ -z "$pid" ] && { log "[$session] claude not running, skip kill"; return 0; }
 
-  local pane_cmd
-  pane_cmd=$(ps -p "$pane_pid" -o comm= 2>/dev/null)
-  [[ "$pane_cmd" == *claude* ]] && return 0
+  log "[$session] killing claude (pid $pid)"
+  kill "$pid" 2>/dev/null || true
 
-  pgrep -P "$pane_pid" -f "claude" > /dev/null 2>&1
+  # Wait up to 10s for it to die
+  local i
+  for i in $(seq 1 10); do
+    kill -0 "$pid" 2>/dev/null || { log "[$session] claude exited after ${i}s"; return 0; }
+    sleep 1
+  done
+
+  # Force kill
+  log "[$session] force killing claude"
+  kill -9 "$pid" 2>/dev/null || true
+  sleep 1
 }
 
-# Start claude in a tmux pane.
-# claude runs inside a shell, so when claude exits the shell (and tmux) stays alive.
-# Just send-keys to the existing shell. If session is gone, create a new one with a shell first.
-start_claude_in_pane() {
-  local session="$1"
-  local project_dir="$2"
-  local cmd="cd $project_dir && claude --dangerously-skip-permissions"
+# Start claude in a tmux session
+start_claude() {
+  local session="$1" dir="$2"
 
-  # If session doesn't exist, create one (with default shell, not claude directly)
+  # After killing claude, the session/pane may be gone. Recreate it.
   if ! tmux has-session -t "$session" 2>/dev/null; then
-    log "start_claude_in_pane: session $session gone, creating new session"
-    tmux new-session -d -s "$session" -c "$project_dir" 2>>"$LOG"
+    log "[$session] session gone, creating new one"
+    tmux new-session -d -s "$session" -c "$dir"
     sleep 1
   fi
 
-  log "start_claude_in_pane: sending command to $session: $cmd"
-  tmux send-keys -t "$session" "$cmd" Enter 2>>"$LOG"
+  log "[$session] starting claude in $dir"
+  tmux send-keys -t "$session" "cd $dir && $CLAUDE_CMD" Enter
 }
 
-restart_one() {
-  local session="$1"
-  local project_dir="$2"
+# Start claude and poll until it's running
+start_and_verify() {
+  local session="$1" dir="$2"
+  start_claude "$session" "$dir"
 
-  for i in $(seq 1 "$MAX_RETRIES"); do
-    log "restart_one: [$session] attempt $i/$MAX_RETRIES"
-    start_claude_in_pane "$session" "$project_dir"
-    sleep 15
-
-    if is_claude_running "$session"; then
-      log "restart_one: [$session] claude started successfully"
+  # Poll up to 30s for claude to appear
+  local i
+  for i in $(seq 1 30); do
+    [ -n "$(find_claude_pid "$session")" ] && {
+      log "[$session] claude is up (${i}s)"
       return 0
-    fi
-    log "restart_one: [$session] attempt $i failed, is_claude_running returned false"
-    # Log pane state for debugging
-    local dbg_dead=$(tmux list-panes -t "$session" -F '#{pane_dead}' 2>/dev/null | head -1)
-    local dbg_pid=$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)
-    local dbg_cmd=$(ps -p "$dbg_pid" -o comm= 2>/dev/null)
-    log "restart_one: [$session] debug: pane_dead=$dbg_dead pane_pid=$dbg_pid pane_cmd=$dbg_cmd"
+    }
+    sleep 1
   done
-  log "restart_one: [$session] all $MAX_RETRIES attempts failed"
+
+  log "[$session] claude did not start within 30s"
+  tmux capture-pane -t "$session" -p 2>/dev/null | tail -5 >> "$LOG"
   return 1
 }
 
+# --- modes ---
+
 do_single() {
-  local session="$1"
-  local project_dir="$2"
-  log "=== do_single: session=$session dir=$project_dir ==="
-  log "do_single: waiting 10s before restart..."
-  sleep 10
-  restart_one "$session" "$project_dir"
-  log "=== do_single: done ==="
+  local session="$1" dir="$2"
+  log "=== restart single: $session ($dir) ==="
+
+  kill_claude "$session"
+
+  local i
+  for i in $(seq 1 "$RETRIES"); do
+    log "[$session] attempt $i/$RETRIES"
+    if start_and_verify "$session" "$dir"; then
+      log "=== restart single: success ==="
+      return 0
+    fi
+    tmux send-keys -t "$session" C-c 2>/dev/null
+    sleep 2
+  done
+
+  log "=== restart single: FAILED after $RETRIES attempts ==="
+  return 1
 }
 
 do_all() {
-  echo "[$(date)] Scanning for active claude sessions..."
+  log "=== restart all: scanning ==="
+  local -a sessions=() dirs=()
 
-  local -a sessions=()
-  local -a dirs=()
-
-  for session in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
-    local pane_path
-    pane_path=$(tmux list-panes -t "$session" -F '#{pane_current_path}' 2>/dev/null | head -1)
-    if pane_has_claude "$session"; then
-      sessions+=("$session")
-      dirs+=("$pane_path")
+  local s
+  for s in $(tmux list-sessions -F '#{session_name}' 2>/dev/null); do
+    if [ -n "$(find_claude_pid "$s")" ]; then
+      sessions+=("$s")
+      dirs+=("$(tmux list-panes -t "$s" -F '#{pane_current_path}' | head -1)")
     fi
   done
 
-  local count=${#sessions[@]}
-  if [ "$count" -eq 0 ]; then
-    echo "[$(date)] No active claude sessions found."
-    exit 1
+  if [ ${#sessions[@]} -eq 0 ]; then
+    log "no active claude sessions found"
+    return 1
   fi
 
-  echo "[$(date)] Found $count active session(s):"
-  for i in $(seq 0 $((count - 1))); do
-    echo "  ${sessions[$i]} -> ${dirs[$i]}"
-  done
+  log "found ${#sessions[@]} session(s): ${sessions[*]}"
 
-  sleep 10
-
-  # Kill all
-  for i in $(seq 0 $((count - 1))); do
-    kill_claude_in_pane "${sessions[$i]}"
-  done
-  sleep 3
+  # Kill all first
+  local i
+  for i in "${!sessions[@]}"; do kill_claude "${sessions[$i]}"; done
 
   # Restart all
   local failed=0
-  for i in $(seq 0 $((count - 1))); do
-    restart_one "${sessions[$i]}" "${dirs[$i]}" || ((failed++))
+  for i in "${!sessions[@]}"; do
+    local attempt
+    for attempt in $(seq 1 "$RETRIES"); do
+      log "[${sessions[$i]}] attempt $attempt/$RETRIES"
+      start_and_verify "${sessions[$i]}" "${dirs[$i]}" && break
+      tmux send-keys -t "${sessions[$i]}" C-c 2>/dev/null
+      sleep 2
+    done
+    [ -z "$(find_claude_pid "${sessions[$i]}")" ] && ((failed++))
   done
 
-  if [ "$failed" -gt 0 ]; then
-    echo "[$(date)] $failed session(s) failed to restart."
-    exit 1
-  fi
-  echo "[$(date)] All sessions restarted successfully."
+  [ "$failed" -gt 0 ] && log "$failed session(s) failed"
+  log "=== restart all: done ==="
 }
 
-# --- Entry point ---
+# --- entry point ---
 
 MODE="${1:?Usage: cc-restart.sh single <session> <project-dir> | cc-restart.sh all}"
 
 if [ "${__RUN:-}" = "1" ]; then
+  log "worker pid=$$ mode=$MODE"
   case "$MODE" in
     single) do_single "$2" "$3" ;;
     all)    do_all ;;
+    *)      log "unknown mode: $MODE"; exit 1 ;;
   esac
 else
-  __RUN=1 nohup "$0" "$@" &>/dev/null &
+  log "launching background worker (mode=$MODE)..."
+  __RUN=1 nohup "$0" "$@" >>"$LOG" 2>&1 &
+  disown
+  log "worker launched (pid $!)"
 fi
